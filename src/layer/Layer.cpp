@@ -816,7 +816,12 @@ void AdvanceWeaponSwitch(LayerState& s)
             ++w.frame;
             return;
         case SwitchPhase::Confirm:
-            if (s.gunAck != w.startGunAck || s.grenadeAck != w.startGrenadeAck)
+            if (w.slot == kEmptyHandsSlot && s.activeSlot == -1)
+            {
+                EndSwitch(s, "holstered");
+                return;
+            }
+            if (w.slot != kEmptyHandsSlot && (s.gunAck != w.startGunAck || s.grenadeAck != w.startGrenadeAck))
             {
                 EndSwitch(s, "confirmed by the game");
                 return;
@@ -832,7 +837,8 @@ void AdvanceWeaponSwitch(LayerState& s)
     }
 }
 
-void BeginGrab(LayerState& s, bool assist, XrPath hand, int slot, Vec3 target, bool holding)
+// target is the holster to press grip in, nullptr to only let go of the gun in hand
+void BeginGrab(LayerState& s, bool assist, XrPath hand, int slot, const Vec3* target, bool holding)
 {
     WeaponSwitch& w = s.weaponSwitch;
     int toggle = 0;
@@ -843,8 +849,11 @@ void BeginGrab(LayerState& s, bool assist, XrPath hand, int slot, Vec3 target, b
     w.toggle = toggle == 1;
     w.hand = hand;
     w.slot = slot;
-    w.target = target;
-    w.phase = holding || slot == kEmptyHandsSlot ? SwitchPhase::Release : SwitchPhase::Move;
+    w.target = target ? *target : Vec3{};
+    // Toggle grip: a press inside a holster swaps the gun in hand for that holster's (or puts it back in its own), a press anywhere else is ignored.
+    // Hold grip: letting go puts the gun away first.
+    bool release = w.toggle ? !target : holding || slot == kEmptyHandsSlot;
+    w.phase = release ? SwitchPhase::Release : SwitchPhase::Move;
     w.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(s.config.weaponSwitchTimeoutMs, 1));
     w.startGunAck = s.gunAck;
     w.startGrenadeAck = s.grenadeAck;
@@ -879,8 +888,12 @@ void StartWeaponSwitch(LayerState& s, int slot, std::vector<std::string>& comman
 {
     if (slot == kEmptyHandsSlot)
     {
-        BeginGrab(s, false, s.gunHand, slot, {}, true);
-        Log("switch to empty hands: holstering the gun in the %s hand (%s grip)", HandName(s, s.gunHand), s.weaponSwitch.toggle ? "toggle" : "hold");
+        int hand = HandIndex(s, s.gunHand);
+        int index = HolsterIndex(s.activeSlot);
+        const Holster* own = hand >= 0 && index >= 0 && s.holsters[index][hand].learned ? &s.holsters[index][hand] : nullptr;
+        BeginGrab(s, false, s.gunHand, slot, own ? &own->local : nullptr, true);
+        Log("switch to empty hands: holstering the gun in the %s hand (%s grip)%s", HandName(s, s.gunHand), s.weaponSwitch.toggle ? "toggle" : "hold",
+            s.weaponSwitch.toggle && !own ? ", its holster is not learned yet so this may not work" : "");
         return;
     }
     int hand = HandIndex(s, s.gunHand);
@@ -898,9 +911,9 @@ void StartWeaponSwitch(LayerState& s, int slot, std::vector<std::string>& comman
     }
     const GripSlot* grip = FindGrip(s, s.gunHand);
     bool holding = s.activeSlot >= 0 || (s.activeSlot == kActiveSlotUnknown && grip && grip->held);
-    BeginGrab(s, false, s.gunHand, slot, holster->local, holding);
+    BeginGrab(s, false, s.gunHand, slot, &holster->local, holding);
     Log("switch to %s with the %s hand (%s grip)%s", HolsterName(slot), HandName(s, s.gunHand), s.weaponSwitch.toggle ? "toggle" : "hold",
-        holding ? ", holstering the current gun first" : "");
+        holding && !s.weaponSwitch.toggle ? ", holstering the current gun first" : "");
 }
 
 // adaptive trigger of the gun hand: a profile per kind of gun, another while firing, loose on an empty magazine
@@ -990,7 +1003,7 @@ void TryStartAssist(LayerState& s, const GripSlot& grip)
     }
     if (best < 0 || bestDistance * 100.0f > static_cast<float>(s.config.holsterAssistRadiusCm))
         return;
-    BeginGrab(s, true, grip.path, kHolsterSlots[best], s.holsters[best][hand].local, false);
+    BeginGrab(s, true, grip.path, kHolsterSlots[best], &s.holsters[best][hand].local, false);
     Log("assisted grab: %s hand %.0f cm from the %s holster", grip.name, bestDistance * 100.0f, kHolsterNames[best]);
     AdvanceWeaponSwitch(s);
 }
@@ -1102,6 +1115,8 @@ void UpdateSqueeze(LayerState& s, XrSession session)
         else if (routed)
         {
             output = grabbing ? 1.0f : 0.0f;
+            if ((output > kHeldThreshold) != (grip.output > kHeldThreshold))
+                Log("%s hand: reload grab %s", grip.name, grabbing ? "pressed, grabbing" : "released");
         }
         else if (s.grenadeToggleActive && !rawPressed && grip.output > kHeldThreshold && now - grip.pressAt < kGrenadeMinPress)
         {
