@@ -71,11 +71,20 @@ constexpr const char* kDrawPrimaryActionName = "tf2vr_draw_primary";
 constexpr const char* kDrawPrimaryLocalizedName = "Draw Primary Weapon";
 constexpr const char* kDrawSecondaryActionName = "tf2vr_draw_secondary";
 constexpr const char* kDrawSecondaryLocalizedName = "Draw Secondary Weapon";
+constexpr const char* kGrabMagazineActionName = "tf2vr_grab_magazine";
+constexpr const char* kGrabMagazineLocalizedName = "Grab Magazine";
 // holster bits in tf2vr_holster_mask: gun slots 0, 1, 3 (arc tool) and 4 while a grenade is ready
 constexpr int kGrenadeSlot = 4;
-constexpr int kHolsterSlots[] = {0, 1, 3, kGrenadeSlot};
-constexpr const char* kHolsterNames[] = {"primary", "secondary", "arc_tool", "grenade"};
-constexpr int kHolsterCount = 4;
+// the magazine pouch has no bit in the holster mask, it is reached with the support hand during a reload
+constexpr int kMagazineSlot = 5;
+constexpr int kHolsterSlots[] = {0, 1, 3, kGrenadeSlot, kMagazineSlot};
+constexpr const char* kHolsterNames[] = {"primary", "secondary", "arc_tool", "grenade", "magazine"};
+constexpr int kHolsterCount = 5;
+constexpr int kMagazineIndex = 4;
+// over the support hand's shoulder, as the mod's reload hint says; right is mirrored for the left hand
+constexpr float kMagazineDefaultRight = 0.15f;
+constexpr float kMagazineDefaultUp = -0.05f;
+constexpr float kMagazineDefaultForward = -0.20f;
 constexpr int kGunSlots[] = {0, 1, 3};
 constexpr float kHolsterLearnRate = 0.3f;
 constexpr int kTogglePulseFrames = 3;
@@ -225,6 +234,8 @@ struct GripSlot
     bool grenadeHeld = false;
     bool waitRelease = false;
     bool forceHeld = false;
+    // Grab Magazine: keeps squeezing while the button is down
+    bool magazineHeld = false;
     bool pressValid = false;
     Vec3 pressLocal;
     bool pressPickup = false;
@@ -332,6 +343,8 @@ struct LayerState
     XrAction nextWeapon = XR_NULL_HANDLE;
     XrAction drawPrimary = XR_NULL_HANDLE;
     XrAction drawSecondary = XR_NULL_HANDLE;
+    XrAction grabMagazine = XR_NULL_HANDLE;
+    ButtonState grabMagazineButton;
     ButtonState nextWeaponButton;
     ButtonState drawPrimaryButton;
     ButtonState drawSecondaryButton;
@@ -497,7 +510,7 @@ void InitializeOnce()
             begin = comma + 1;
             int slot = name == "empty" ? kEmptyHandsSlot : -1;
             for (int i = 0; i < kHolsterCount; ++i)
-                if (name == kHolsterNames[i])
+                if (name == kHolsterNames[i] && kHolsterSlots[i] != kMagazineSlot)
                     slot = kHolsterSlots[i];
             if (slot == -1)
             {
@@ -687,6 +700,8 @@ void UpdateGameVars(LayerState& s)
 }
 
 // where the hand was when the grip closed, so a later gun or grenade ack can teach the holster position
+void LearnHolster(LayerState& s, const GripSlot& grip, int slot);
+
 void SnapshotPress(LayerState& s, GripSlot& grip)
 {
     int hand = HandIndex(s, grip.path);
@@ -695,6 +710,9 @@ void SnapshotPress(LayerState& s, GripSlot& grip)
     grip.pressValid = HandLocatable(s, hand);
     if (grip.pressValid)
         grip.pressLocal = ToLocal(s.head, s.hands[hand].position);
+    // a support hand squeeze up near the shoulder during a reload is a reach for the magazine pouch
+    if (s.reloadWaiting && grip.path != s.gunHand && grip.pressValid && !grip.pressSynthetic && grip.pressLocal.y > -0.35f && grip.pressLocal.z < 0.05f)
+        LearnHolster(s, grip, kMagazineSlot);
 }
 
 void LearnHolster(LayerState& s, const GripSlot& grip, int slot)
@@ -801,6 +819,13 @@ void AdvanceWeaponSwitch(LayerState& s)
             if (w.frame >= std::max(s.config.weaponSwitchGrabFrames, 1))
             {
                 GripSlot* grip = FindGrip(s, w.hand);
+                if (w.slot == kMagazineSlot)
+                {
+                    if (grip)
+                        grip->magazineHeld = s.grabMagazineButton.pressed;
+                    EndSwitch(s, s.grabMagazineButton.pressed ? "grabbed, held while the button is down" : "grabbed");
+                    return;
+                }
                 if (!w.assist && !w.toggle && grip && !grip->rawPressed)
                 {
                     grip->forceHeld = true;
@@ -944,13 +969,40 @@ void UpdateTriggers(LayerState& s)
         triggers::SetTrigger(hand, hand == gun ? effect : TriggerEffect{});
 }
 
+// moves the support hand into the magazine pouch and squeezes there, then keeps squeezing while the button is held
+void StartMagazineGrab(LayerState& s)
+{
+    XrPath support = s.gunHand == s.leftHand ? s.rightHand : s.leftHand;
+    int hand = HandIndex(s, support);
+    const char* blocked = s.menuState != 0                                          ? "menu open"
+                        : !s.reloadWaiting                                         ? "not reloading"
+                        : s.weaponSwitch.phase != SwitchPhase::Idle                ? "a switch is already running"
+                        : s.multiplayer && !s.config.multiplayerButtonDraws        ? "off in multiplayer ([multiplayer] button_draws)"
+                        : !HandLocatable(s, hand)                                  ? "support hand pose unavailable"
+                                                                                   : nullptr;
+    if (blocked)
+    {
+        Log("grab magazine ignored: %s", blocked);
+        return;
+    }
+    const Holster& pouch = s.holsters[kMagazineIndex][hand];
+    Vec3 target = pouch.learned ? pouch.local
+                                : Vec3{hand == 0 ? -kMagazineDefaultRight : kMagazineDefaultRight, kMagazineDefaultUp, kMagazineDefaultForward};
+    BeginGrab(s, false, support, kMagazineSlot, &target, false);
+    Log("grab magazine with the %s hand at right %.0f up %.0f forward %.0f cm (%s)", HandName(s, support), target.x * 100.0f, target.y * 100.0f,
+        target.z * 100.0f, pouch.learned ? "learned" : "default, grab a magazine by hand once to learn it");
+}
+
 void UpdateWeaponButtons(LayerState& s, XrSession session, std::vector<std::string>& commands)
 {
     std::vector<std::string> none;
     UpdateCommandAction(s, session, s.nextWeapon, s.nextWeaponButton, "next weapon", {}, {}, none);
     UpdateCommandAction(s, session, s.drawPrimary, s.drawPrimaryButton, "draw primary", {}, {}, none);
     UpdateCommandAction(s, session, s.drawSecondary, s.drawSecondaryButton, "draw secondary", {}, {}, none);
+    UpdateCommandAction(s, session, s.grabMagazine, s.grabMagazineButton, "grab magazine", {}, {}, none);
     auto pressed = [](const ButtonState& button) { return button.changed && button.pressed; };
+    if (pressed(s.grabMagazineButton))
+        StartMagazineGrab(s);
     int slot = -2;
     if (pressed(s.nextWeaponButton))
         slot = NextGunSlot(s);
@@ -1128,6 +1180,18 @@ void UpdateSqueeze(LayerState& s, XrSession session)
         if (faked)
         {
             output = w.squeeze;
+        }
+        else if (grip.magazineHeld)
+        {
+            if (!s.grabMagazineButton.pressed || s.menuState != 0)
+            {
+                grip.magazineHeld = false;
+                Log("%s hand: magazine let go", grip.name);
+            }
+            else
+            {
+                output = 1.0f;
+            }
         }
         else if (grip.forceHeld)
         {
@@ -1627,6 +1691,7 @@ XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance)
     s.head = {};
     s.nextWeapon = XR_NULL_HANDLE;
     s.detonate = XR_NULL_HANDLE;
+    s.grabMagazine = XR_NULL_HANDLE;
     s.drawPrimary = XR_NULL_HANDLE;
     s.drawSecondary = XR_NULL_HANDLE;
     s.nextWeaponButton = {};
@@ -1657,6 +1722,7 @@ XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCr
     XrAction nextWeapon = weapons ? CreateLayerAction(s, *actionSet, kNextWeaponActionName, kNextWeaponLocalizedName, {}) : XR_NULL_HANDLE;
     XrAction drawPrimary = weapons ? CreateLayerAction(s, *actionSet, kDrawPrimaryActionName, kDrawPrimaryLocalizedName, {}) : XR_NULL_HANDLE;
     XrAction drawSecondary = weapons ? CreateLayerAction(s, *actionSet, kDrawSecondaryActionName, kDrawSecondaryLocalizedName, {}) : XR_NULL_HANDLE;
+    XrAction grabMagazine = weapons ? CreateLayerAction(s, *actionSet, kGrabMagazineActionName, kGrabMagazineLocalizedName, {}) : XR_NULL_HANDLE;
     XrAction detonate = s.config.detonateEnabled ? CreateLayerAction(s, *actionSet, kDetonateActionName, kDetonateLocalizedName, {}) : XR_NULL_HANDLE;
 
     std::lock_guard lock(s.mutex);
@@ -1667,6 +1733,8 @@ XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCr
     s.drawPrimary = drawPrimary;
     s.drawSecondary = drawSecondary;
     s.detonate = detonate;
+    s.grabMagazine = grabMagazine;
+    s.grabMagazineButton = {};
     s.detonateButton = {};
     s.tacticalButton = {};
     s.crouchButton = {};

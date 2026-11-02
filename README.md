@@ -13,6 +13,7 @@ Bind them in SteamVR → Settings → Controllers → **Manage Controller Bindin
 | **Tactical Ability** | Cloak. The trigger of the hand without the gun then stops cloaking | Any button |
 | **Next Weapon** | Steps through primary → secondary → arc tool → empty hands, skipping what you don't carry. Change the order with `[weapon_switch] cycle` | Any button |
 | **Draw Primary Weapon** / **Draw Secondary Weapon** | Draws that gun | Any button |
+| **Grab Magazine** | During a reload, moves your free hand to the magazine pouch over its shoulder and grabs a magazine; hold the button to keep it, bring it to the gun and let go. Learns the pouch from your own grabs | Any button on the free hand |
 | **Detonate Satchels** | Sets off your planted satchels (needs Titanfall 2 VR 1.0.25 or newer) | Any button |
 
 Tip: set the mod's **VR Settings → Gun Grip** to **Toggle** to hold your gun with one press of Grip.
