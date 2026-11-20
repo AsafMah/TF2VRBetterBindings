@@ -44,6 +44,7 @@ struct Config
     bool detonateEnabled = true;
     bool multiplayerButtonDraws = false;
     bool multiplayerAssist = false;
+    std::string fingersReportProfile;
     bool triggersEnabled = true;
     std::wstring triggersCapiPath;
     // adaptive trigger profile per tf2vrbb_trigger_kind, "<mode> <parameters>", see TriggerHaptics.h

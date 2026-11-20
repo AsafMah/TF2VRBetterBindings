@@ -111,6 +111,9 @@ struct NextFunctions
     PFN_xrLocateSpace locateSpace = nullptr;
     PFN_xrLocateSpaces locateSpaces = nullptr;
     PFN_xrLocateViews locateViews = nullptr;
+    PFN_xrGetCurrentInteractionProfile getCurrentInteractionProfile = nullptr;
+    PFN_xrCreateHandTrackerEXT createHandTracker = nullptr;
+    PFN_xrLocateHandJointsEXT locateHandJoints = nullptr;
 };
 
 struct Vec3
@@ -374,6 +377,12 @@ struct LayerState
     std::chrono::steady_clock::time_point firingUntil;
     int commandTicket = kCommandTicketBase;
     bool loggedSpoofBase = false;
+    // finger tracking diagnostics and the optional profile report for the mod's finger tracking
+    XrPath touchProfile = XR_NULL_PATH;
+    XrPath indexProfile = XR_NULL_PATH;
+    XrPath reportedProfile[2] = {XR_NULL_PATH, XR_NULL_PATH};
+    XrHandTrackerEXT handTrackers[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    int handJointsActive[2] = {-1, -1};
     uint64_t frame = 0;
     int loggedSqueezeQueries = 0;
     int loggedBooleanQueries = 0;
@@ -521,6 +530,7 @@ void InitializeOnce()
             if (std::find(s.weaponCycle.begin(), s.weaponCycle.end(), slot) == s.weaponCycle.end())
                 s.weaponCycle.push_back(slot);
         }
+        Log("config: fingers report_profile='%s'", s.config.fingersReportProfile.c_str());
         Log("config: triggers=%d capi_path='%ls' firing_ms=%d", s.config.triggersEnabled, s.config.triggersCapiPath.c_str(), s.config.triggerFiringMs);
         auto parseTrigger = [](const char* key, const std::string& text, TriggerEffect& effect) {
             if (!ParseTriggerEffect(text, effect))
@@ -2003,6 +2013,64 @@ XrResult XRAPI_CALL HookGetActionStateVector2f(XrSession session, const XrAction
     return result;
 }
 
+XrResult XRAPI_CALL HookGetCurrentInteractionProfile(XrSession session, XrPath topLevelUserPath, XrInteractionProfileState* state)
+{
+    LayerState& s = State();
+    XrResult result = s.next.getCurrentInteractionProfile(session, topLevelUserPath, state);
+    if (XR_FAILED(result) || !state)
+        return result;
+    std::lock_guard lock(s.mutex);
+    int hand = HandIndex(s, topLevelUserPath);
+    if (hand < 0)
+        return result;
+    XrPath real = state->interactionProfile;
+    // PS VR2 Sense controllers reach games as Oculus Touch; [fingers] report_profile=index makes the mod treat them as Index controllers,
+    // which it limits finger tracking to
+    if (s.config.fingersReportProfile == "index" && real == s.touchProfile && s.indexProfile != XR_NULL_PATH)
+        state->interactionProfile = s.indexProfile;
+    if (real != s.reportedProfile[hand])
+    {
+        s.reportedProfile[hand] = real;
+        Log("%s hand interaction profile %s%s", kHandNames[hand], PathText(s, real).c_str(),
+            state->interactionProfile != real ? ", reported to the game as the Index controller" : "");
+    }
+    return result;
+}
+
+XrResult XRAPI_CALL HookLocateHandJoints(XrHandTrackerEXT tracker, const XrHandJointsLocateInfoEXT* info, XrHandJointLocationsEXT* locations)
+{
+    LayerState& s = State();
+    XrResult result = s.next.locateHandJoints(tracker, info, locations);
+    if (!locations)
+        return result;
+    std::lock_guard lock(s.mutex);
+    int hand = s.handTrackers[0] == tracker ? 0 : s.handTrackers[1] == tracker ? 1 : -1;
+    int active = XR_SUCCEEDED(result) && locations->isActive ? 1 : 0;
+    if (hand >= 0 && active != s.handJointsActive[hand])
+    {
+        s.handJointsActive[hand] = active;
+        Log("%s hand finger joints %s (%d)", kHandNames[hand], active ? "tracked" : "not tracked", result);
+    }
+    return result;
+}
+
+XrResult XRAPI_CALL HookCreateHandTracker(XrSession session, const XrHandTrackerCreateInfoEXT* info, XrHandTrackerEXT* tracker)
+{
+    LayerState& s = State();
+    XrResult result = s.next.createHandTracker(session, info, tracker);
+    if (XR_FAILED(result) || !info || !tracker)
+        return result;
+    std::lock_guard lock(s.mutex);
+    int hand = info->hand == XR_HAND_LEFT_EXT ? 0 : info->hand == XR_HAND_RIGHT_EXT ? 1 : -1;
+    if (hand >= 0)
+    {
+        s.handTrackers[hand] = *tracker;
+        s.handJointsActive[hand] = -1;
+        Log("%s hand tracker created", kHandNames[hand]);
+    }
+    return result;
+}
+
 struct Hook
 {
     const char* name;
@@ -2023,6 +2091,7 @@ const Hook kHooks[] = {
     {"xrLocateSpace", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateSpace)},
     {"xrLocateSpaces", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateSpaces)},
     {"xrLocateViews", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateViews)},
+    {"xrGetCurrentInteractionProfile", reinterpret_cast<PFN_xrVoidFunction>(&HookGetCurrentInteractionProfile)},
 };
 
 XrResult XRAPI_CALL LayerGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function)
@@ -2048,7 +2117,23 @@ XrResult XRAPI_CALL LayerGetInstanceProcAddr(XrInstance instance, const char* na
         *function = nullptr;
         return XR_ERROR_HANDLE_INVALID;
     }
-    return s.next.getInstanceProcAddr(instance, name, function);
+    XrResult result = s.next.getInstanceProcAddr(instance, name, function);
+    // extension functions exist only once the game enabled the extension, so they are wrapped when asked for
+    if (s.active && XR_SUCCEEDED(result) && *function)
+    {
+        if (std::strcmp(name, "xrCreateHandTrackerEXT") == 0)
+        {
+            s.next.createHandTracker = reinterpret_cast<PFN_xrCreateHandTrackerEXT>(*function);
+            *function = reinterpret_cast<PFN_xrVoidFunction>(&HookCreateHandTracker);
+            Log("game uses XR_EXT_hand_tracking");
+        }
+        else if (std::strcmp(name, "xrLocateHandJointsEXT") == 0)
+        {
+            s.next.locateHandJoints = reinterpret_cast<PFN_xrLocateHandJointsEXT>(*function);
+            *function = reinterpret_cast<PFN_xrVoidFunction>(&HookLocateHandJoints);
+        }
+    }
+    return result;
 }
 
 XrResult XRAPI_CALL LayerCreateApiLayerInstance(const XrInstanceCreateInfo* info, const XrApiLayerCreateInfo* layerInfo, XrInstance* instance)
@@ -2090,7 +2175,8 @@ XrResult XRAPI_CALL LayerCreateApiLayerInstance(const XrInstanceCreateInfo* info
                     ResolveNext(s, "xrCreateReferenceSpace", s.next.createReferenceSpace) &&
                     ResolveNext(s, "xrCreateActionSpace", s.next.createActionSpace) &&
                     ResolveNext(s, "xrLocateSpace", s.next.locateSpace) &&
-                    ResolveNext(s, "xrLocateViews", s.next.locateViews);
+                    ResolveNext(s, "xrLocateViews", s.next.locateViews) &&
+                    ResolveNext(s, "xrGetCurrentInteractionProfile", s.next.getCurrentInteractionProfile);
     if (!resolved)
     {
         Log("layer disabled: next functions unavailable");
@@ -2100,6 +2186,8 @@ XrResult XRAPI_CALL LayerCreateApiLayerInstance(const XrInstanceCreateInfo* info
 
     s.leftHand = ToPath(s, "/user/hand/left");
     s.rightHand = ToPath(s, "/user/hand/right");
+    s.touchProfile = ToPath(s, "/interaction_profiles/oculus/touch_controller");
+    s.indexProfile = ToPath(s, "/interaction_profiles/valve/index_controller");
     s.tacticalHand = s.config.tacticalHand == "left" ? s.leftHand : s.config.tacticalHand == "right" ? s.rightHand : XR_NULL_PATH;
     PFN_xrVoidFunction locateSpaces = nullptr;
     if (XR_SUCCEEDED(s.next.getInstanceProcAddr(s.instance, "xrLocateSpaces", &locateSpaces)))

@@ -34,6 +34,10 @@ Works with the Titanfall 2 VR multiplayer beta. Because matches are rated, the w
 
 With PS VR2 Sense controllers and [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) installed, the trigger of the hand holding the gun pushes back differently for pistols, automatics, marksman rifles, shotguns, launchers, the arc tool and Titan weapons, buzzes while automatics fire, and goes loose on an empty magazine. It is off in menus and during reloads. Tune or turn it off in `[triggers]` of the `.ini`. Without PSVR2Toolkit nothing happens.
 
+### Finger tracking on PS VR2 (experimental)
+
+Titanfall 2 VR animates your fingers on the gun only for Valve Index and Steam Frame controllers. PS VR2 Sense controllers sense your fingers too, but SteamVR presents them to games as Oculus Touch. `[fingers] report_profile=index` makes the game believe it has Index controllers so it may turn finger tracking on. It is an experiment: gun angles and button prompts can be those of the Index. The log says which controllers the game sees and whether finger data arrives.
+
 > [!IMPORTANT]
 > **Optional features.** Turn them on in `TF2VR\packages\Nighteyes-TF2VRBetterBindings-<version>\plugins\layer\TF2VRBetterBindings.ini`, then restart the game.
 >

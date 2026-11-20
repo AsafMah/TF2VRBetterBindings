@@ -88,6 +88,7 @@ Config LoadConfig(const std::wstring& path)
     config.detonateEnabled = ReadBool(path, L"detonate", L"enabled", config.detonateEnabled);
     config.multiplayerButtonDraws = ReadBool(path, L"multiplayer", L"button_draws", config.multiplayerButtonDraws);
     config.multiplayerAssist = ReadBool(path, L"multiplayer", L"holster_assist", config.multiplayerAssist);
+    config.fingersReportProfile = ReadNarrow(path, L"fingers", L"report_profile", config.fingersReportProfile);
     config.triggersEnabled = ReadBool(path, L"triggers", L"enabled", config.triggersEnabled);
     config.triggersCapiPath = ReadString(path, L"triggers", L"capi_path", config.triggersCapiPath);
     for (int kind = 0; kind < kTriggerKindCount; ++kind)
